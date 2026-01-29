@@ -13,7 +13,7 @@ final class WebSocketManager: NSObject {
     var onMessage: ((String) -> Void)?
 
     func connect() {
-        let url = URL(string: "wss://3305980e7d9d.ngrok-free.app")!
+        let url = URL(string: "wss://c86e9d583a80.ngrok-free.app")!
         socket = URLSession.shared.webSocketTask(with: url)
         socket?.resume()
         receive()
