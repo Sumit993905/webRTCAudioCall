@@ -1,10 +1,3 @@
-//
-//  WebRTCManager.swift
-//  webRTCAudioCall
-//
-//  Created by Sumit Raj Chingari on 29/01/26.
-//
-
 import Foundation
 import WebRTC
 import AVFoundation
@@ -12,14 +5,23 @@ import Combine
 
 final class WebRTCManager: NSObject, ObservableObject {
 
+    // MARK: - UI State
     @Published var callState = "Idle"
+
+    // MARK: - Signaling
     private let socket = WebSocketManager()
 
+    // MARK: - Call State Flags
+    private var isCaller = false
+    private var remoteSDPSet = false
+    private var pendingICE: [RTCIceCandidate] = []
 
+    // MARK: - WebRTC Core
     private var peerConnection: RTCPeerConnection!
     private var factory: RTCPeerConnectionFactory!
     private var audioTrack: RTCAudioTrack!
 
+    // MARK: - Init
     override init() {
         super.init()
         setupAudioSession()
@@ -29,19 +31,25 @@ final class WebRTCManager: NSObject, ObservableObject {
         setupSocket()
     }
 
+    // MARK: - WebSocket
     private func setupSocket() {
         socket.connect()
 
-        socket.onMessage = { [weak self] text in
-            self?.handleSignal(text)
+        socket.onMessage = { [unowned self] text in
+            DispatchQueue.main.async {
+                self.handleSignal(text)
+            }
         }
     }
-
 
     // MARK: - Audio Session
     private func setupAudioSession() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .voiceChat)
+        try? session.setCategory(
+            .playAndRecord,
+            mode: .voiceChat,
+            options: [.defaultToSpeaker]
+        )
         try? session.setActive(true)
     }
 
@@ -72,39 +80,41 @@ final class WebRTCManager: NSObject, ObservableObject {
 
     // MARK: - Audio Track
     private func setupAudioTrack() {
-        let source = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+        let source = factory.audioSource(
+            with: RTCMediaConstraints(
+                mandatoryConstraints: nil,
+                optionalConstraints: nil
+            )
+        )
+
         audioTrack = factory.audioTrack(with: source, trackId: "audio0")
         peerConnection.add(audioTrack, streamIds: ["stream0"])
     }
 
-    // MARK: - Call Control
+    // MARK: - Caller Only
     @MainActor
     func startCall() {
-        callState = "Calling..."
+        guard !isCaller else { return }
+
+        isCaller = true
+        callState = "Calling…"
 
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: ["OfferToReceiveAudio": "true"],
             optionalConstraints: nil
         )
 
-        peerConnection.offer(for: constraints) { sdp, _ in
+        peerConnection.offer(for: constraints) { [unowned self] sdp, _ in
             guard let sdp = sdp else { return }
+
             self.peerConnection.setLocalDescription(sdp)
+            self.sendSignal(type: "offer", sdp: sdp.sdp)
 
-            let msg = SignalMessage(
-                type: "offer",
-                sdp: sdp.sdp,
-                candidate: nil,
-                sdpMid: nil,
-                sdpMLineIndex: nil
-            )
-
-            let data = try! JSONEncoder().encode(msg)
-            self.socket.send(text: String(data: data, encoding: .utf8)!)
             print("📤 Offer sent")
         }
     }
-    
+
+    // MARK: - Signaling Handler
     @MainActor
     private func handleSignal(_ text: String) {
 
@@ -115,123 +125,141 @@ final class WebRTCManager: NSObject, ObservableObject {
 
         switch msg.type {
 
+        // ---------- OFFER (callee) ----------
         case "offer":
-            guard let sdp = msg.sdp else { return }
+            guard !isCaller, let sdp = msg.sdp else { return }
 
             let offer = RTCSessionDescription(type: .offer, sdp: sdp)
-            peerConnection.setRemoteDescription(offer)
 
-            peerConnection.answer(for: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)) { [unowned self] answer, _ in
+            peerConnection.setRemoteDescription(offer) { _ in
+                self.remoteSDPSet = true
+                self.flushPendingICE()
+            }
+
+            let constraints = RTCMediaConstraints(
+                mandatoryConstraints: ["OfferToReceiveAudio": "true"],
+                optionalConstraints: nil
+            )
+
+            peerConnection.answer(for: constraints) { [unowned self] answer, _ in
                 guard let answer = answer else { return }
 
                 self.peerConnection.setLocalDescription(answer)
+                self.sendSignal(type: "answer", sdp: answer.sdp)
 
-                let reply = SignalMessage(
-                    type: "answer",
-                    sdp: answer.sdp,
-                    candidate: nil,
-                    sdpMid: nil,
-                    sdpMLineIndex: nil
-                )
-
-                let data = try! JSONEncoder().encode(reply)
-                socket.send(text: String(decoding: data, as: UTF8.self))
+                print("📤 Answer sent")
             }
 
+        // ---------- ANSWER (caller) ----------
         case "answer":
-            guard let sdp = msg.sdp else { return }
+            guard isCaller, let sdp = msg.sdp else { return }
 
             let answer = RTCSessionDescription(type: .answer, sdp: sdp)
-            peerConnection.setRemoteDescription(answer)
-            callState = "Connected 🎧"
 
+            peerConnection.setRemoteDescription(answer) { _ in
+                self.remoteSDPSet = true
+                self.flushPendingICE()
+                self.callState = "Connected 🎧"
+            }
+
+        // ---------- ICE ----------
         case "ice":
             guard
-                let candidate = msg.candidate,
-                let sdpMid = msg.sdpMid,
+                let c = msg.candidate,
+                let mid = msg.sdpMid,
                 let index = msg.sdpMLineIndex
             else { return }
 
             let ice = RTCIceCandidate(
-                sdp: candidate,
+                sdp: c,
                 sdpMLineIndex: Int32(index),
-                sdpMid: sdpMid
+                sdpMid: mid
             )
 
-            peerConnection.add(ice)
+            if remoteSDPSet {
+                peerConnection.add(ice)
+            } else {
+                pendingICE.append(ice)
+            }
 
         default:
             break
         }
     }
 
-
-
-    func endCall() {
-        callState = "Call Ended"
-
-        socket.onMessage = nil
-        socket.disconnect()
-
-        peerConnection.close()
-        peerConnection = nil
+    // MARK: - ICE Helpers
+    private func flushPendingICE() {
+        pendingICE.forEach { peerConnection.add($0) }
+        pendingICE.removeAll()
     }
-    
-}
 
-extension WebRTCManager : RTCPeerConnectionDelegate {
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection,
-                        didGenerate candidate: RTCIceCandidate) {
-
+    private func sendSignal(
+        type: String,
+        sdp: String? = nil,
+        candidate: String? = nil,
+        mid: String? = nil,
+        index: Int? = nil
+    ) {
         let msg = SignalMessage(
-            type: "ice",
-            sdp: nil,
-            candidate: candidate.sdp,
-            sdpMid: candidate.sdpMid,
-            sdpMLineIndex: Int(candidate.sdpMLineIndex)
+            type: type,
+            sdp: sdp,
+            candidate: candidate,
+            sdpMid: mid,
+            sdpMLineIndex: index
         )
 
         let data = try! JSONEncoder().encode(msg)
-        socket.send(text: String(data: data, encoding: .utf8)!)
+        socket.send(text: String(decoding: data, as: UTF8.self))
+    }
+
+    // MARK: - End Call
+    func endCall() {
+        callState = "Call Ended"
+        socket.onMessage = nil
+        socket.disconnect()
+        peerConnection.close()
+        peerConnection = nil
+    }
+}
+
+// MARK: - RTCPeerConnectionDelegate
+extension WebRTCManager: RTCPeerConnectionDelegate {
+
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didGenerate candidate: RTCIceCandidate) {
+
+        sendSignal(
+            type: "ice",
+            candidate: candidate.sdp,
+            mid: candidate.sdpMid,
+            index: Int(candidate.sdpMLineIndex)
+        )
+
         print("❄️ ICE sent")
     }
 
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
-        print("ICE state:", stateChanged.rawValue)
-    }
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
-        
-    }
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {
-        
-    }
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        
-    }
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
-        
-    }
-    
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {
-        
-    }
-    
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
-        
-    }
-    
-    func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {
-        
-    }
-    
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didChange stateChanged: RTCSignalingState) {}
 
-    
-    
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didChange newState: RTCIceConnectionState) {
+        print("ICE state:", newState.rawValue)
+    }
+
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didChange newState: RTCIceGatheringState) {}
+
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didAdd stream: RTCMediaStream) {}
+
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didRemove stream: RTCMediaStream) {}
+
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didRemove candidates: [RTCIceCandidate]) {}
+
+    func peerConnection(_ peerConnection: RTCPeerConnection,
+                        didOpen dataChannel: RTCDataChannel) {}
+
+    func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
 }
-
